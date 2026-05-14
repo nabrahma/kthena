@@ -33,6 +33,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	listerv1 "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/util/retry"
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog/v2"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -256,8 +257,24 @@ func (mc *ModelBoosterController) isModelServingActive(model *workload.ModelBoos
 
 // updateModelBoosterStatus updates model status.
 func (mc *ModelBoosterController) updateModelBoosterStatus(ctx context.Context, modelBooster *workload.ModelBooster) error {
-	modelBooster.Status.ObservedGeneration = modelBooster.Generation
-	if _, err := mc.client.WorkloadV1alpha1().ModelBoosters(modelBooster.Namespace).UpdateStatus(ctx, modelBooster, metav1.UpdateOptions{}); err != nil {
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		latest, err := mc.modelBoosterLister.ModelBoosters(modelBooster.Namespace).Get(modelBooster.Name)
+		if err != nil {
+			return err
+		}
+		updated := latest.DeepCopy()
+		for i := range modelBooster.Status.Conditions {
+			meta.SetStatusCondition(&updated.Status.Conditions, modelBooster.Status.Conditions[i])
+		}
+		updated.Status.ObservedGeneration = updated.Generation
+		res, err := mc.client.WorkloadV1alpha1().ModelBoosters(updated.Namespace).UpdateStatus(ctx, updated, metav1.UpdateOptions{})
+		if err != nil {
+			return err
+		}
+		modelBooster.Status = res.Status
+		return nil
+	})
+	if err != nil {
 		klog.Errorf("update modelBooster status failed: %v", err)
 		return err
 	}
