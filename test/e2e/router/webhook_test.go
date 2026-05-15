@@ -68,11 +68,9 @@ func WaitForKthenaRouterValidatingWebhook(t *testing.T, ctx context.Context, kth
 		_, err := kthenaClient.NetworkingV1alpha1().ModelRoutes(namespace).Create(ctx, probe, metav1.CreateOptions{DryRun: []string{"All"}})
 		if err != nil {
 			errStr := err.Error()
-			// CHANGE 1: added EOF, connection reset by peer, no endpoints available.
-			// EOF is the primary failure mode — the router pod accepts the TCP
-			// connection but drops it mid-TLS handshake during partial startup after
-			// TestRouterConfigUpdate restarts the pod. Without EOF here the test
-			// dies instantly with no retry on the most common failure case.
+			// We retry on transient connection errors that occur when the router pod
+			// is restarting. EOF is a common failure mode where the pod accepts
+			// the TCP connection but drops it during the TLS handshake.
 			if strings.Contains(errStr, "connect: connection refused") ||
 				strings.Contains(errStr, "i/o timeout") ||
 				strings.Contains(errStr, "context deadline exceeded") ||
