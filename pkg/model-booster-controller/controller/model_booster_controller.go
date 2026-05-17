@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	networkingv1alpha1 "github.com/volcano-sh/kthena/pkg/apis/networking/v1alpha1"
@@ -76,8 +77,8 @@ type ModelBoosterController struct {
 	kubeInformerFactory               informers.SharedInformerFactory
 	workQueue                         workqueue.TypedRateLimitingInterface[any]
 	// loraUpdateCache stores the previous model version for LoRA adapter comparison
-	// Key format: "namespace/name:generation" to avoid version conflicts
-	loraUpdateCache map[string]*workload.ModelBooster
+	loraUpdateCacheMu sync.Mutex
+	loraUpdateCache   map[string]*workload.ModelBooster
 }
 
 func (mc *ModelBoosterController) Run(ctx context.Context, workers int) {
@@ -170,7 +171,9 @@ func (mc *ModelBoosterController) updateModelBooster(old any, new any) {
 	if oldModel.Status.ObservedGeneration != newModel.Generation {
 		// Store the old model in cache with generation-specific key to avoid conflicts
 		cacheKey := fmt.Sprintf("%s/%s:%d", newModel.Namespace, newModel.Name, newModel.Generation)
+		mc.loraUpdateCacheMu.Lock()
 		mc.loraUpdateCache[cacheKey] = oldModel.DeepCopy()
+		mc.loraUpdateCacheMu.Unlock()
 
 		mc.enqueueModelBooster(newModel)
 	}
@@ -192,10 +195,11 @@ func (mc *ModelBoosterController) reconcile(ctx context.Context, namespaceAndNam
 	if err != nil {
 		return fmt.Errorf("invalid resource key: %s", err)
 	}
-	model, err := mc.modelBoosterLister.ModelBoosters(namespace).Get(name)
+	cached, err := mc.modelBoosterLister.ModelBoosters(namespace).Get(name)
 	if err != nil {
 		return client.IgnoreNotFound(err)
 	}
+	model := cached.DeepCopy()
 	klog.InfoS("Start to process model", "namespace", namespace, "model name", model.Name, "model status", model.Status)
 	if len(model.Status.Conditions) == 0 {
 		if err := mc.setModelInitCondition(ctx, model); err != nil {
@@ -271,6 +275,8 @@ func (mc *ModelBoosterController) updateModelBoosterStatus(ctx context.Context, 
 // Cache key format: "namespace/name:generation"
 func (mc *ModelBoosterController) cleanupOutdatedLoraUpdateCache(modelBooster *workload.ModelBooster) {
 	prefix := fmt.Sprintf("%s/%s:", modelBooster.Namespace, modelBooster.Name)
+	mc.loraUpdateCacheMu.Lock()
+	defer mc.loraUpdateCacheMu.Unlock()
 	for key := range mc.loraUpdateCache {
 		if strings.HasPrefix(key, prefix) {
 			// Keep only the current generation entry, remove others
