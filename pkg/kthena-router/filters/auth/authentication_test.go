@@ -334,7 +334,7 @@ func TestValidateIssuer(t *testing.T) {
 	})
 }
 
-// verify token expiration across all supported claim types(time.Time, float64, json.number)
+// verify token expiration across all supported claim types(time.Time, float64, json.Number)
 // including expired tokens, valid tokens, invalid names and unsupported types
 
 func TestValidateExpiration(t *testing.T) {
@@ -454,7 +454,7 @@ func TestValidateNotBefore(t *testing.T) {
 	})
 }
 
-// verifies the iat claim rejects tokens issues too far in the future
+// verifies the iat claim rejects tokens issued too far in the future
 // while allowing a 1 minute clock skew across all supported types
 
 func TestValidateIssuedAt(t *testing.T) {
