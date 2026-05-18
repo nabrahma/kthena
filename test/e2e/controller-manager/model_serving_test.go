@@ -2296,6 +2296,11 @@ func TestModelServingBinPackScaleDownCombined(t *testing.T) {
 func TestModelServingStatusAwarePriorityScaleDownServingGroup(t *testing.T) {
 	ctx, kthenaClient, kubeClient := setupControllerManagerE2ETest(t)
 
+	const (
+		initialReplicas = int32(4)
+		targetReplicas  = int32(3)
+	)
+
 	modelServing := createBasicModelServing("test-status-sg-priority", 4, 0)
 	t.Log("Creating ModelServing with 4 servingGroup replicas for status-aware scale down test")
 	createAndWaitForModelServing(t, ctx, kthenaClient, modelServing)
@@ -2316,14 +2321,46 @@ func TestModelServingStatusAwarePriorityScaleDownServingGroup(t *testing.T) {
 	err = kubeClient.CoreV1().Pods(testNamespace).Delete(ctx, targetPod.Name, metav1.DeleteOptions{})
 	require.NoError(t, err, "Failed to delete pod")
 
-	initialMS, err := kthenaClient.WorkloadV1alpha1().ModelServings(testNamespace).Get(ctx, modelServing.Name, metav1.GetOptions{})
-	require.NoError(t, err, "Failed to get ModelServing before scale down")
-	scaleDownMS := initialMS.DeepCopy()
-	scaleDownMS.Spec.Replicas = ptr.To(int32(3))
-
 	t.Log("Scaling down ModelServing from 4 to 3 servingGroups (expect disrupted group to be removed first)")
-	_, err = kthenaClient.WorkloadV1alpha1().ModelServings(testNamespace).Update(ctx, scaleDownMS, metav1.UpdateOptions{})
-	require.NoError(t, err, "Failed to scale down ModelServing")
+	require.Eventually(t, func() bool {
+		disruptedGroupSelector := fmt.Sprintf("%s,%s=%s", labelSelector, workload.GroupNameLabelKey, unhealthyGroup)
+		groupPods, listErr := kubeClient.CoreV1().Pods(testNamespace).List(ctx, metav1.ListOptions{
+			LabelSelector: disruptedGroupSelector,
+		})
+		if listErr != nil {
+			t.Logf("Failed to list pods in disrupted serving group %s: %v", unhealthyGroup, listErr)
+			return false
+		}
+
+		for _, pod := range groupPods.Items {
+			if pod.DeletionTimestamp != nil || pod.Status.Phase != corev1.PodRunning {
+				continue
+			}
+			return false
+		}
+
+		ms, getErr := kthenaClient.WorkloadV1alpha1().ModelServings(testNamespace).Get(ctx, modelServing.Name, metav1.GetOptions{})
+		if getErr != nil {
+			t.Logf("Failed to get ModelServing before scale down: %v", getErr)
+			return false
+		}
+
+		if ms.Spec.Replicas == nil || *ms.Spec.Replicas != initialReplicas {
+			return false
+		}
+		if ms.Status.AvailableReplicas != targetReplicas {
+			return false
+		}
+
+		scaleDownMS := ms.DeepCopy()
+		scaleDownMS.Spec.Replicas = ptr.To(targetReplicas)
+		_, updateErr := kthenaClient.WorkloadV1alpha1().ModelServings(testNamespace).Update(ctx, scaleDownMS, metav1.UpdateOptions{})
+		if updateErr != nil {
+			t.Logf("Failed to scale down ModelServing: %v", updateErr)
+			return false
+		}
+		return true
+	}, 2*time.Minute, 2*time.Second, "Failed to trigger scale down after disruption was observed")
 
 	utils.WaitForModelServingReady(t, ctx, kthenaClient, testNamespace, modelServing.Name)
 	waitForRunningPodCount(t, ctx, kubeClient, modelServing.Name, 3, 3*time.Minute)
@@ -2337,7 +2374,7 @@ func TestModelServingStatusAwarePriorityScaleDownServingGroup(t *testing.T) {
 		if pod.DeletionTimestamp != nil || pod.Status.Phase != corev1.PodRunning {
 			continue
 		}
-		assert.NotEqual(t, unhealthyGroup, pod.Labels[workload.GroupNameLabelKey],
+		require.NotEqual(t, unhealthyGroup, pod.Labels[workload.GroupNameLabelKey],
 			"Running pods should not belong to the disrupted serving group after status-aware scale down")
 	}
 	t.Log("Status-aware priority scale down ServingGroup test passed successfully")
