@@ -531,28 +531,26 @@ func (r *Router) handleHTTPRoute(c *gin.Context, gatewayKey string) (bool, types
 			}
 			for _, match := range rule.Matches {
 				if match.Path != nil {
-					pathType := match.Path.Type
-					pathValue := match.Path.Value
-					if pathType != nil {
-						switch *pathType {
-						case gatewayv1.PathMatchExact:
-							if c.Request.URL.Path == *pathValue {
-								matched = true
-								break
-							}
-						case gatewayv1.PathMatchPathPrefix:
-							if strings.HasPrefix(c.Request.URL.Path, *pathValue) {
-								matched = true
-								matchedPrefix = *pathValue // Store matched prefix
-								break
-							}
-						case gatewayv1.PathMatchRegularExpression:
-							if regexMatched, err := regexp.MatchString(*pathValue, c.Request.URL.Path); err == nil && regexMatched {
-								matched = true
-								break
-							} else if err != nil {
-								klog.Warningf("Invalid regex pattern '%s' in HTTPRoute %s/%s: %v", *pathValue, route.Namespace, route.Name, err)
-							}
+					pathType := httpPathMatchType(match.Path)
+					pathValue := httpPathMatchValue(match.Path)
+					switch pathType {
+					case gatewayv1.PathMatchExact:
+						if c.Request.URL.Path == pathValue {
+							matched = true
+							break
+						}
+					case gatewayv1.PathMatchPathPrefix:
+						if ok, prefix := matchHTTPPathPrefix(c.Request.URL.Path, pathValue); ok {
+							matched = true
+							matchedPrefix = prefix
+							break
+						}
+					case gatewayv1.PathMatchRegularExpression:
+						if regexMatched, err := regexp.MatchString(pathValue, c.Request.URL.Path); err == nil && regexMatched {
+							matched = true
+							break
+						} else if err != nil {
+							klog.Warningf("Invalid regex pattern '%s' in HTTPRoute %s/%s: %v", pathValue, route.Namespace, route.Name, err)
 						}
 					}
 				} else {
@@ -627,6 +625,28 @@ func (r *Router) handleHTTPRoute(c *gin.Context, gatewayKey string) (bool, types
 	}
 
 	return true, inferencePoolName
+}
+
+func httpPathMatchType(path *gatewayv1.HTTPPathMatch) gatewayv1.PathMatchType {
+	if path.Type == nil {
+		return gatewayv1.PathMatchPathPrefix
+	}
+	return *path.Type
+}
+
+func httpPathMatchValue(path *gatewayv1.HTTPPathMatch) string {
+	if path.Value == nil {
+		return "/"
+	}
+	return *path.Value
+}
+
+func matchHTTPPathPrefix(path, prefix string) (bool, string) {
+	normalizedPrefix := strings.TrimRight(prefix, "/")
+	if normalizedPrefix == "" {
+		return strings.HasPrefix(path, "/"), "/"
+	}
+	return path == normalizedPrefix || strings.HasPrefix(path, normalizedPrefix+"/"), normalizedPrefix
 }
 
 // applyURLRewrite applies HTTPURLRewriteFilter to the request
