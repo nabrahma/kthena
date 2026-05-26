@@ -35,6 +35,7 @@ spec:
               workload.serving.volcano.sh/model-uid: randomUID
               workload.serving.volcano.sh/revision: 98d947c88
           spec:
+            affinity: {}
             containers:
               - args:
                   - --port
@@ -218,6 +219,7 @@ spec:
               workload.serving.volcano.sh/model-uid: randomUID
               workload.serving.volcano.sh/revision: 98d947c88
           spec:
+            affinity: {}
             containers:
               - args:
                   - --port

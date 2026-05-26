@@ -202,6 +202,8 @@ func buildVllmDisaggregatedModelServing(model *workload.ModelBooster) (*workload
 		"ENGINE_PREFILL_IMAGE":               workersMap[workload.ModelWorkerTypePrefill].Image,
 		"SCHEDULER_NAME":                     backend.SchedulerName,
 		"RUNTIME_CLASS_NAME":                 backend.RuntimeClassName,
+		"PREFILL_AFFINITY":                   workersMap[workload.ModelWorkerTypePrefill].Affinity,
+		"DECODE_AFFINITY":                    workersMap[workload.ModelWorkerTypeDecode].Affinity,
 	}
 	return loadModelServingTemplate(VllmDisaggregatedTemplatePath, &data)
 }
@@ -322,6 +324,7 @@ func buildVllmModelServing(model *workload.ModelBooster) (*workload.ModelServing
 		"WORKER_REPLICAS":                    workersMap[workload.ModelWorkerTypeServer].Pods - 1,
 		"SCHEDULER_NAME":                     backend.SchedulerName,
 		"RUNTIME_CLASS_NAME":                 backend.RuntimeClassName,
+		"SERVER_AFFINITY":                    workersMap[workload.ModelWorkerTypeServer].Affinity,
 	}
 	return loadModelServingTemplate(VllmTemplatePath, &data)
 }
