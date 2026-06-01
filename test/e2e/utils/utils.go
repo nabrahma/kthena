@@ -59,7 +59,7 @@ func WaitForModelServingReady(t *testing.T, ctx context.Context, kthenaClient *c
 		if ms.Spec.Replicas != nil {
 			expectedReplicas = *ms.Spec.Replicas
 		}
-		return ms.Status.ObservedGeneration >= ms.Generation &&
+		return ms.Status.ObservedGeneration == ms.Generation &&
 			ms.Status.Replicas >= expectedReplicas &&
 			ms.Status.AvailableReplicas >= expectedReplicas, nil
 	})
