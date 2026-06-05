@@ -28,7 +28,6 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -519,104 +518,21 @@ func (r *Router) getPodsAndServer(modelServerName types.NamespacedName) ([]*data
 // Returns true if HTTPRoute was matched and request is being handled, false otherwise
 // Also returns the InferencePool NamespacedName if found
 func (r *Router) handleHTTPRoute(c *gin.Context, gatewayKey string) (bool, types.NamespacedName) {
-	// Find HTTPRoutes for this Gateway
-	httpRoutes := r.store.GetHTTPRoutesByGateway(gatewayKey)
-	if len(httpRoutes) == 0 {
-		return false, types.NamespacedName{}
-	}
-
-	// Match HTTPRoute by path and hostname
-	var matchedRoute *gatewayv1.HTTPRoute
-	var matchedPrefix string // Store the matched prefix for URL rewriting
-	for _, route := range httpRoutes {
-		if route == nil {
-			continue
-		}
-
-		matched := false
-		for _, rule := range route.Spec.Rules {
-			if len(rule.Matches) == 0 {
-				matched = true
-				break
-			}
-			for _, match := range rule.Matches {
-				if match.Path != nil {
-					pathType := httpPathMatchType(match.Path)
-					pathValue := httpPathMatchValue(match.Path)
-					switch pathType {
-					case gatewayv1.PathMatchExact:
-						if c.Request.URL.Path == pathValue {
-							matched = true
-							break
-						}
-					case gatewayv1.PathMatchPathPrefix:
-						if ok, prefix := matchHTTPPathPrefix(c.Request.URL.Path, pathValue); ok {
-							matched = true
-							matchedPrefix = prefix
-							break
-						}
-					case gatewayv1.PathMatchRegularExpression:
-						if regexMatched, err := regexp.MatchString(pathValue, c.Request.URL.Path); err == nil && regexMatched {
-							matched = true
-							break
-						} else if err != nil {
-							klog.Warningf("Invalid regex pattern '%s' in HTTPRoute %s/%s: %v", pathValue, route.Namespace, route.Name, err)
-						}
-					}
-				} else {
-					matched = true
-				}
-				if matched {
-					break
-				}
-			}
-			if matched {
-				matchedRoute = route
-				break
-			}
-		}
-		if matched {
-			break
-		}
-	}
-
-	if matchedRoute == nil {
+	matchResult, matched := r.findHTTPRouteMatch(c, gatewayKey)
+	if !matched {
 		return false, types.NamespacedName{}
 	}
 
 	// Record Gateway API match into access log (gatewayKey is already "namespace/name").
-	httpRouteKey := fmt.Sprintf("%s/%s", matchedRoute.Namespace, matchedRoute.Name)
+	httpRouteKey := fmt.Sprintf("%s/%s", matchResult.route.Namespace, matchResult.route.Name)
 	accesslog.SetGatewayAPIInfo(c, gatewayKey, httpRouteKey, "")
 
 	// Store the matched prefix in context for URL rewriting
-	if matchedPrefix != "" {
-		c.Set("matchedPrefix", matchedPrefix)
+	if matchResult.matchedPrefix != "" {
+		c.Set("matchedPrefix", matchResult.matchedPrefix)
 	}
 
-	// Find InferencePool backendRef and apply filters
-	var inferencePoolName types.NamespacedName
-	found := false
-	var matchedRule *gatewayv1.HTTPRouteRule
-	for i := range matchedRoute.Spec.Rules {
-		rule := &matchedRoute.Spec.Rules[i]
-		for _, backendRef := range rule.BackendRefs {
-			if backendRef.Group != nil && *backendRef.Group == "inference.networking.k8s.io" &&
-				backendRef.Kind != nil && *backendRef.Kind == "InferencePool" {
-				inferencePoolName.Namespace = matchedRoute.Namespace
-				if backendRef.Namespace != nil {
-					inferencePoolName.Namespace = string(*backendRef.Namespace)
-				}
-				inferencePoolName.Name = string(backendRef.Name)
-				found = true
-				matchedRule = rule
-				break
-			}
-		}
-		if found {
-			break
-		}
-	}
-
+	inferencePoolName, found := inferencePoolFromHTTPRouteRule(matchResult.route, matchResult.rule)
 	if !found {
 		return false, types.NamespacedName{}
 	}
@@ -625,9 +541,9 @@ func (r *Router) handleHTTPRoute(c *gin.Context, gatewayKey string) (bool, types
 	inferencePoolKey := fmt.Sprintf("%s/%s", inferencePoolName.Namespace, inferencePoolName.Name)
 	accesslog.SetGatewayAPIInfo(c, "", "", inferencePoolKey)
 
-	// Apply HTTPURLRewriteFilter if present
-	if matchedRule != nil && matchedRule.Filters != nil {
-		for _, filter := range matchedRule.Filters {
+	// Apply HTTPURLRewriteFilter from the same rule that matched the request.
+	if matchResult.rule.Filters != nil {
+		for _, filter := range matchResult.rule.Filters {
 			if filter.Type == gatewayv1.HTTPRouteFilterURLRewrite && filter.URLRewrite != nil {
 				r.applyURLRewrite(c, filter.URLRewrite)
 			}
@@ -635,28 +551,6 @@ func (r *Router) handleHTTPRoute(c *gin.Context, gatewayKey string) (bool, types
 	}
 
 	return true, inferencePoolName
-}
-
-func httpPathMatchType(path *gatewayv1.HTTPPathMatch) gatewayv1.PathMatchType {
-	if path.Type == nil {
-		return gatewayv1.PathMatchPathPrefix
-	}
-	return *path.Type
-}
-
-func httpPathMatchValue(path *gatewayv1.HTTPPathMatch) string {
-	if path.Value == nil {
-		return "/"
-	}
-	return *path.Value
-}
-
-func matchHTTPPathPrefix(path, prefix string) (bool, string) {
-	normalizedPrefix := strings.TrimRight(prefix, "/")
-	if normalizedPrefix == "" {
-		return strings.HasPrefix(path, "/"), "/"
-	}
-	return path == normalizedPrefix || strings.HasPrefix(path, normalizedPrefix+"/"), normalizedPrefix
 }
 
 // applyURLRewrite applies HTTPURLRewriteFilter to the request

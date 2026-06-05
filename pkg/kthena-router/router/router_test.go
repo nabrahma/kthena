@@ -39,6 +39,8 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/klog/v2"
 
+	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
+
 	aiv1alpha1 "github.com/volcano-sh/kthena/pkg/apis/networking/v1alpha1"
 	"github.com/volcano-sh/kthena/pkg/kthena-router/accesslog"
 	"github.com/volcano-sh/kthena/pkg/kthena-router/common"
@@ -46,7 +48,6 @@ import (
 	"github.com/volcano-sh/kthena/pkg/kthena-router/datastore"
 	"github.com/volcano-sh/kthena/pkg/kthena-router/metrics"
 	"github.com/volcano-sh/kthena/pkg/kthena-router/utils"
-	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
 
 func TestMain(m *testing.M) {
@@ -74,8 +75,8 @@ func setupTestRouter(t *testing.T, backendHandler http.Handler) (*Router, datast
 func TestRouter_HandleHTTPRoute_PathPrefix(t *testing.T) {
 	pathType := gatewayv1.PathMatchPathPrefix
 	kind := gatewayv1.Kind("Gateway")
-	group := gatewayv1.Group("inference.networking.k8s.io")
-	backendKind := gatewayv1.Kind("InferencePool")
+	group := inferencePoolBackendGroup
+	backendKind := inferencePoolBackendKind
 
 	tests := []struct {
 		name           string
@@ -241,6 +242,401 @@ func TestRouter_HandleHTTPRoute_PathPrefix(t *testing.T) {
 			prefix, exists := c.Get("matchedPrefix")
 			assert.True(t, exists)
 			assert.Equal(t, tt.expectedPrefix, prefix)
+		})
+	}
+}
+
+func TestRouter_HandleHTTPRoute_UsesMatchedRuleBackend(t *testing.T) {
+	pathType := gatewayv1.PathMatchPathPrefix
+	kind := gatewayv1.Kind("Gateway")
+	group := inferencePoolBackendGroup
+	backendKind := inferencePoolBackendKind
+	prefixA := "/a"
+	prefixB := "/b"
+	store := datastore.New()
+	router := &Router{store: store}
+	route := &gatewayv1.HTTPRoute{
+		ObjectMeta: v1.ObjectMeta{Name: "route", Namespace: "default"},
+		Spec: gatewayv1.HTTPRouteSpec{
+			CommonRouteSpec: gatewayv1.CommonRouteSpec{
+				ParentRefs: []gatewayv1.ParentReference{
+					{
+						Name: "gw",
+						Kind: &kind,
+					},
+				},
+			},
+			Rules: []gatewayv1.HTTPRouteRule{
+				{
+					Matches: []gatewayv1.HTTPRouteMatch{
+						{
+							Path: &gatewayv1.HTTPPathMatch{
+								Type:  &pathType,
+								Value: &prefixA,
+							},
+						},
+					},
+					BackendRefs: []gatewayv1.HTTPBackendRef{
+						{
+							BackendRef: gatewayv1.BackendRef{
+								BackendObjectReference: gatewayv1.BackendObjectReference{
+									Group: &group,
+									Kind:  &backendKind,
+									Name:  "pool-a",
+								},
+							},
+						},
+					},
+				},
+				{
+					Matches: []gatewayv1.HTTPRouteMatch{
+						{
+							Path: &gatewayv1.HTTPPathMatch{
+								Type:  &pathType,
+								Value: &prefixB,
+							},
+						},
+					},
+					BackendRefs: []gatewayv1.HTTPBackendRef{
+						{
+							BackendRef: gatewayv1.BackendRef{
+								BackendObjectReference: gatewayv1.BackendObjectReference{
+									Group: &group,
+									Kind:  &backendKind,
+									Name:  "pool-b",
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	assert.NoError(t, store.AddOrUpdateHTTPRoute(route))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request, _ = http.NewRequest(http.MethodPost, "/b/chat", nil)
+
+	matched, pool := router.handleHTTPRoute(c, "default/gw")
+	assert.True(t, matched)
+	assert.Equal(t, types.NamespacedName{Namespace: "default", Name: "pool-b"}, pool)
+}
+
+func TestRouter_HandleHTTPRoute_PrefersLongestPrefix(t *testing.T) {
+	pathType := gatewayv1.PathMatchPathPrefix
+	kind := gatewayv1.Kind("Gateway")
+	group := inferencePoolBackendGroup
+	backendKind := inferencePoolBackendKind
+	rootPrefix := "/"
+	chatPrefix := "/chat"
+	store := datastore.New()
+	router := &Router{store: store}
+	route := &gatewayv1.HTTPRoute{
+		ObjectMeta: v1.ObjectMeta{Name: "route", Namespace: "default"},
+		Spec: gatewayv1.HTTPRouteSpec{
+			CommonRouteSpec: gatewayv1.CommonRouteSpec{
+				ParentRefs: []gatewayv1.ParentReference{
+					{
+						Name: "gw",
+						Kind: &kind,
+					},
+				},
+			},
+			Rules: []gatewayv1.HTTPRouteRule{
+				{
+					Matches: []gatewayv1.HTTPRouteMatch{
+						{
+							Path: &gatewayv1.HTTPPathMatch{
+								Type:  &pathType,
+								Value: &rootPrefix,
+							},
+						},
+					},
+					BackendRefs: []gatewayv1.HTTPBackendRef{
+						{
+							BackendRef: gatewayv1.BackendRef{
+								BackendObjectReference: gatewayv1.BackendObjectReference{
+									Group: &group,
+									Kind:  &backendKind,
+									Name:  "pool-root",
+								},
+							},
+						},
+					},
+				},
+				{
+					Matches: []gatewayv1.HTTPRouteMatch{
+						{
+							Path: &gatewayv1.HTTPPathMatch{
+								Type:  &pathType,
+								Value: &chatPrefix,
+							},
+						},
+					},
+					BackendRefs: []gatewayv1.HTTPBackendRef{
+						{
+							BackendRef: gatewayv1.BackendRef{
+								BackendObjectReference: gatewayv1.BackendObjectReference{
+									Group: &group,
+									Kind:  &backendKind,
+									Name:  "pool-chat",
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	assert.NoError(t, store.AddOrUpdateHTTPRoute(route))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request, _ = http.NewRequest(http.MethodPost, "/chat/completions", nil)
+
+	matched, pool := router.handleHTTPRoute(c, "default/gw")
+	assert.True(t, matched)
+	assert.Equal(t, types.NamespacedName{Namespace: "default", Name: "pool-chat"}, pool)
+	prefix, exists := c.Get("matchedPrefix")
+	assert.True(t, exists)
+	assert.Equal(t, "/chat", prefix)
+}
+
+func TestRouter_HandleHTTPRoute_UsesMatchedRuleURLRewrite(t *testing.T) {
+	pathType := gatewayv1.PathMatchPathPrefix
+	rewriteType := gatewayv1.PrefixMatchHTTPPathModifier
+	kind := gatewayv1.Kind("Gateway")
+	group := inferencePoolBackendGroup
+	backendKind := inferencePoolBackendKind
+	prefixA := "/a"
+	prefixB := "/b"
+	wrongPrefix := "/wrong"
+	rightPrefix := "/right"
+	store := datastore.New()
+	router := &Router{store: store}
+	route := &gatewayv1.HTTPRoute{
+		ObjectMeta: v1.ObjectMeta{Name: "route", Namespace: "default"},
+		Spec: gatewayv1.HTTPRouteSpec{
+			CommonRouteSpec: gatewayv1.CommonRouteSpec{
+				ParentRefs: []gatewayv1.ParentReference{
+					{
+						Name: "gw",
+						Kind: &kind,
+					},
+				},
+			},
+			Rules: []gatewayv1.HTTPRouteRule{
+				{
+					Matches: []gatewayv1.HTTPRouteMatch{
+						{
+							Path: &gatewayv1.HTTPPathMatch{
+								Type:  &pathType,
+								Value: &prefixA,
+							},
+						},
+					},
+					Filters: []gatewayv1.HTTPRouteFilter{
+						{
+							Type: gatewayv1.HTTPRouteFilterURLRewrite,
+							URLRewrite: &gatewayv1.HTTPURLRewriteFilter{
+								Path: &gatewayv1.HTTPPathModifier{
+									Type:               rewriteType,
+									ReplacePrefixMatch: &wrongPrefix,
+								},
+							},
+						},
+					},
+					BackendRefs: []gatewayv1.HTTPBackendRef{
+						{
+							BackendRef: gatewayv1.BackendRef{
+								BackendObjectReference: gatewayv1.BackendObjectReference{
+									Group: &group,
+									Kind:  &backendKind,
+									Name:  "pool-a",
+								},
+							},
+						},
+					},
+				},
+				{
+					Matches: []gatewayv1.HTTPRouteMatch{
+						{
+							Path: &gatewayv1.HTTPPathMatch{
+								Type:  &pathType,
+								Value: &prefixB,
+							},
+						},
+					},
+					Filters: []gatewayv1.HTTPRouteFilter{
+						{
+							Type: gatewayv1.HTTPRouteFilterURLRewrite,
+							URLRewrite: &gatewayv1.HTTPURLRewriteFilter{
+								Path: &gatewayv1.HTTPPathModifier{
+									Type:               rewriteType,
+									ReplacePrefixMatch: &rightPrefix,
+								},
+							},
+						},
+					},
+					BackendRefs: []gatewayv1.HTTPBackendRef{
+						{
+							BackendRef: gatewayv1.BackendRef{
+								BackendObjectReference: gatewayv1.BackendObjectReference{
+									Group: &group,
+									Kind:  &backendKind,
+									Name:  "pool-b",
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	assert.NoError(t, store.AddOrUpdateHTTPRoute(route))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request, _ = http.NewRequest(http.MethodPost, "/b/chat", nil)
+
+	matched, pool := router.handleHTTPRoute(c, "default/gw")
+	assert.True(t, matched)
+	assert.Equal(t, types.NamespacedName{Namespace: "default", Name: "pool-b"}, pool)
+	assert.Equal(t, "/right/chat", c.Request.URL.Path)
+}
+
+func TestRouter_HandleHTTPRoute_HostnameMatch(t *testing.T) {
+	pathType := gatewayv1.PathMatchPathPrefix
+	kind := gatewayv1.Kind("Gateway")
+	group := inferencePoolBackendGroup
+	backendKind := inferencePoolBackendKind
+	path := "/chat"
+	route := &gatewayv1.HTTPRoute{
+		ObjectMeta: v1.ObjectMeta{Name: "route", Namespace: "default"},
+		Spec: gatewayv1.HTTPRouteSpec{
+			CommonRouteSpec: gatewayv1.CommonRouteSpec{
+				ParentRefs: []gatewayv1.ParentReference{
+					{
+						Name: "gw",
+						Kind: &kind,
+					},
+				},
+			},
+			Hostnames: []gatewayv1.Hostname{"api.example.com"},
+			Rules: []gatewayv1.HTTPRouteRule{
+				{
+					Matches: []gatewayv1.HTTPRouteMatch{
+						{
+							Path: &gatewayv1.HTTPPathMatch{
+								Type:  &pathType,
+								Value: &path,
+							},
+						},
+					},
+					BackendRefs: []gatewayv1.HTTPBackendRef{
+						{
+							BackendRef: gatewayv1.BackendRef{
+								BackendObjectReference: gatewayv1.BackendObjectReference{
+									Group: &group,
+									Kind:  &backendKind,
+									Name:  "pool",
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	wildcardRoute := &gatewayv1.HTTPRoute{
+		ObjectMeta: v1.ObjectMeta{
+			Name:      "wildcard-route",
+			Namespace: "default",
+		},
+		Spec: gatewayv1.HTTPRouteSpec{
+			CommonRouteSpec: gatewayv1.CommonRouteSpec{
+				ParentRefs: []gatewayv1.ParentReference{
+					{
+						Name: "gw",
+						Kind: &kind,
+					},
+				},
+			},
+			Hostnames: []gatewayv1.Hostname{"*.example.com"},
+			Rules: []gatewayv1.HTTPRouteRule{
+				{
+					Matches: []gatewayv1.HTTPRouteMatch{
+						{
+							Path: &gatewayv1.HTTPPathMatch{
+								Type:  &pathType,
+								Value: &path,
+							},
+						},
+					},
+					BackendRefs: []gatewayv1.HTTPBackendRef{
+						{
+							BackendRef: gatewayv1.BackendRef{
+								BackendObjectReference: gatewayv1.BackendObjectReference{
+									Group: &group,
+									Kind:  &backendKind,
+									Name:  "pool-wildcard",
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	tests := []struct {
+		name          string
+		routes        []*gatewayv1.HTTPRoute
+		host          string
+		expectedMatch bool
+		expectedPool  types.NamespacedName
+	}{
+		{
+			name:          "hostname matches",
+			routes:        []*gatewayv1.HTTPRoute{route},
+			host:          "api.example.com:8080",
+			expectedMatch: true,
+			expectedPool:  types.NamespacedName{Namespace: "default", Name: "pool"},
+		},
+		{
+			name:          "hostname mismatch",
+			routes:        []*gatewayv1.HTTPRoute{route},
+			host:          "other.example.com",
+			expectedMatch: false,
+		},
+		{
+			name:          "wildcard hostname matches",
+			routes:        []*gatewayv1.HTTPRoute{wildcardRoute},
+			host:          "api.example.com",
+			expectedMatch: true,
+			expectedPool:  types.NamespacedName{Namespace: "default", Name: "pool-wildcard"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := datastore.New()
+			router := &Router{store: store}
+			for _, route := range tt.routes {
+				assert.NoError(t, store.AddOrUpdateHTTPRoute(route))
+			}
+
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			c.Request, _ = http.NewRequest(http.MethodPost, "/chat", nil)
+			c.Request.Host = tt.host
+
+			matched, pool := router.handleHTTPRoute(c, "default/gw")
+			assert.Equal(t, tt.expectedMatch, matched)
+			if tt.expectedMatch {
+				assert.Equal(t, tt.expectedPool, pool)
+			}
 		})
 	}
 }
