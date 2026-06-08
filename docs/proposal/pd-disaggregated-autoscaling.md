@@ -481,6 +481,10 @@ spec:
 | `roles` map keys must reference existing roles in the referenced ModelServing and contain at least two entries. | `DisaggregatedTarget` |
 | `minReplicas <= maxReplicas` for each role. | `RoleScalingParam` |
 | For each `ratioConstraints` item: `numeratorRole != denominatorRole`, both roles exist in `roles`, and `minRatio <= maxRatio`. | `RoleRatioConstraint` (CEL) |
+| No two `ratioConstraints` items may share the same `(numeratorRole, denominatorRole)` pair. | `DisaggregatedTarget` (CEL) |
+| For each inverse pair `(A→B, B→A)`, the ranges must overlap: `[minRatio, maxRatio]` of `B→A` must intersect `[1/maxRatio, 1/minRatio]` of `A→B`. | `DisaggregatedTarget` (webhook) |
+| For every cycle in the constraint graph, the product of `minRatio` values ≤ 1 and the product of `maxRatio` values ≥ 1. | `DisaggregatedTarget` (webhook) |
+| For each transitive path `A→…→C`, if an explicit `A→C` constraint exists, the implied range (product of edge ranges) must overlap with the explicit range. | `DisaggregatedTarget` (webhook) |
 | For each `ratioConstraints` item, bounds must be jointly achievable given role min/max replicas (when denominator min > 0). | `DisaggregatedTarget` |
 | For every constrained role pair `(A,B)`, scalable-to-zero must match: `roles[A].minReplicas == 0` **iff** `roles[B].minReplicas == 0`. | `DisaggregatedTarget` (CEL) |
 
@@ -494,6 +498,219 @@ spec:
 4. **Coupled scale-to-zero (per constrained pair)**: For each pair appearing in `ratioConstraints`, both roles in that pair must reach zero together. The controller does not evaluate that pair's ratio while either side is `0`.
 5. **Ratio enforcement**: For each configured role pair, when both roles are non-zero, after clamping the controller adjusts replica counts to satisfy `minRatio <= replicas[numeratorRole]/replicas[denominatorRole] <= maxRatio`.
 6. **Atomic patch**: The controller patches all affected `spec.template.roles[*].replicas` in a single ModelServing update to avoid transient states that violate ratio constraints.
+
+#### Multi-Constraint Conflict Analysis
+
+When `ratioConstraints` contains multiple entries, the constraints may be mutually unsatisfiable. This section enumerates all known conflict categories and specifies how the system must detect or handle each one.
+
+##### Conflict Taxonomy
+
+###### Type 1: Cyclic Inconsistency
+
+When constraints form a directed cycle — for example three constraints `A→B`, `B→C`, `C→A` — the product of ratios around the cycle is a mathematical identity:
+
+$$\frac{r_A}{r_B} \times \frac{r_B}{r_C} \times \frac{r_C}{r_A} = 1$$
+
+For the cycle to be satisfiable, the product of the constraint ranges must contain `1`:
+
+- product of all `minRatio` values along the cycle ≤ 1
+- product of all `maxRatio` values along the cycle ≥ 1
+
+**Example (infeasible)**:
+
+```yaml
+ratioConstraints:
+  - numeratorRole: A
+    denominatorRole: B
+    minRatio: "0.5"          # A/B = 0.5
+    maxRatio: "0.5"
+  - numeratorRole: B
+    denominatorRole: C
+    minRatio: "0.5"          # B/C = 0.5
+    maxRatio: "0.5"
+  - numeratorRole: C
+    denominatorRole: A
+    minRatio: "0.5"          # C/A = 0.5
+    maxRatio: "0.5"
+```
+
+Product of `minRatio`: `0.5 × 0.5 × 0.5 = 0.125 < 1` ✓, but product of `maxRatio`: `0.5 × 0.5 × 0.5 = 0.125 < 1` ✗. The range `[0.125, 0.125]` does not contain `1`, so no solution exists.
+
+A consistent version would be:
+
+```yaml
+ratioConstraints:
+  - numeratorRole: A
+    denominatorRole: B
+    minRatio: "0.5"
+    maxRatio: "1"
+  - numeratorRole: B
+    denominatorRole: C
+    minRatio: "0.5"
+    maxRatio: "1"
+  - numeratorRole: C
+    denominatorRole: A
+    minRatio: "1"
+    maxRatio: "4"
+# min product = 0.5 × 0.5 × 1 = 0.25 ≤ 1  ✓
+# max product = 1 × 1 × 4 = 4 ≥ 1  ✓
+```
+
+This generalizes to any cycle length: for a cycle of `k` edges, the product condition must hold.
+
+###### Type 2: Transitive Inconsistency
+
+Two constraints `A→B` and `B→C` imply a derived range for `A→C`:
+
+$$m_{AB} \times m_{BC} \leq \frac{r_A}{r_C} \leq M_{AB} \times M_{BC}$$
+
+If the user also provides an explicit `A→C` constraint, the explicit range must overlap with the implied range. Otherwise the constraints are unsatisfiable.
+
+**Example (infeasible)**:
+
+```yaml
+ratioConstraints:
+  - numeratorRole: A
+    denominatorRole: B
+    minRatio: "2"
+    maxRatio: "3"    # A/B ∈ [2,3]
+  - numeratorRole: B
+    denominatorRole: C
+    minRatio: "2"
+    maxRatio: "3"    # B/C ∈ [2,3]
+  # Implied: A/C ∈ [4, 9]
+  - numeratorRole: A
+    denominatorRole: C
+    minRatio: "1"
+    maxRatio: "2"   # A/C ∈ [1,2] — no overlap with [4,9]
+```
+
+###### Type 3: Inverse Pair Inconsistency
+
+If both `A→B` and `B→A` constraints exist, they must be inverses. Constraint `A→B ∈ [m₁, M₁]` implies `B→A ∈ [1/M₁, 1/m₁]`. The explicit `B→A ∈ [m₂, M₂]` must overlap:
+
+$$\max(m_2,\ 1/M_1) \leq \min(M_2,\ 1/m_1)$$
+
+**Example (infeasible)**:
+
+```yaml
+ratioConstraints:
+  - numeratorRole: A
+    denominatorRole: B
+    minRatio: "2"
+    maxRatio: "3"    # A/B ∈ [2,3] → B/A ∈ [0.33,0.5]
+  - numeratorRole: B
+    denominatorRole: A
+    minRatio: "1"
+    maxRatio: "2"    # B/A ∈ [1,2] — no overlap with [0.33,0.5]
+```
+
+###### Type 4: Duplicate Pair Conflict
+
+Two constraints that reference the same ordered pair `(A, B)` with non-overlapping ranges.
+
+**Example (infeasible)**:
+
+```yaml
+ratioConstraints:
+  - numeratorRole: A
+    denominatorRole: B
+    minRatio: "1"
+    maxRatio: "2"
+  - numeratorRole: A
+    denominatorRole: B
+    minRatio: "4"
+    maxRatio: "5"
+```
+
+###### Type 5: Replica Bound–Ratio Conflict
+
+Even if ratio constraints are mathematically consistent with each other, they may be unsatisfiable given the integer `minReplicas`/`maxReplicas` bounds of each role.
+
+**Example (infeasible)**:
+
+```yaml
+roles:
+  A:
+    minReplicas: 1
+    maxReplicas: 2
+  B:
+    minReplicas: 1
+    maxReplicas: 2
+ratioConstraints:
+  - numeratorRole: A
+    denominatorRole: B
+    minRatio: "3"
+    maxRatio: "4"
+# A/B ≥ 3 requires A ≥ 3·B ≥ 3, but maxReplicas(A) = 2.
+```
+
+###### Type 6: Integer Feasibility Gap
+
+A constraint range that is satisfiable in continuous values but has no integer solution within the replica bounds.
+
+**Example (infeasible in integers)**:
+
+```yaml
+roles:
+  A:
+    minReplicas: 1
+    maxReplicas: 1
+  B:
+    minReplicas: 3
+    maxReplicas: 3
+ratioConstraints:
+  - { numeratorRole: A, denominatorRole: B, minRatio: "0.4", maxRatio: "0.45" }
+# A/B = 1/3 ≈ 0.333, outside [0.4, 0.45]. No other integer combination is possible.
+```
+
+##### Detection Strategy
+
+Conflicts are detected at **two stages**:
+
+| Stage | Checks | Mechanism |
+|-------|--------|-----------|
+| **Admission (webhook)** | Type 1 (cycle product), Type 2 (transitive overlap), Type 3 (inverse pair), Type 4 (duplicate pair), Type 5 (bound–ratio) | Webhook validates on create/update. Build a directed constraint graph, enumerate all simple cycles (bounded by role count), verify product conditions, compute transitive closures, cross-check with replica bounds. |
+| **Runtime (controller)** | Type 6 (integer feasibility), edge cases missed by continuous analysis | Controller reports `RatioConstraintViolated` condition when no integer assignment satisfies all constraints simultaneously. |
+
+Admission-time validation algorithm sketch:
+
+1. **Build constraint graph**: Nodes = role names, directed edge for each `RoleRatioConstraint` labeled with `[minRatio, maxRatio]`.
+2. **Reject duplicate pairs** (Type 4): Error if two edges share the same `(numeratorRole, denominatorRole)`.
+3. **Merge inverse pairs** (Type 3): For each edge `A→B [m, M]`, if edge `B→A [m', M']` also exists, verify `[m', M'] ∩ [1/M, 1/m] ≠ ∅`.
+4. **Cycle detection** (Type 1): Find all simple cycles using DFS. For each cycle, multiply the `minRatio` values and `maxRatio` values along the cycle. Reject if the product range does not contain `1`.
+5. **Transitive closure** (Type 2): For each pair `(A, C)` reachable via a path `A→…→C`, compute the implied range by multiplying edge ranges along the path. If an explicit `A→C` edge exists, verify overlap.
+6. **Bound feasibility** (Type 5): For each edge `A→B [m, M]`, verify: `m ≤ maxReplicas(A)/minReplicas(B)` and `M ≥ minReplicas(A)/maxReplicas(B)` (when denominators > 0).
+
+> **Complexity**: With `N` roles, the number of simple cycles is at most exponential in `N`, but in practice `N` is small (typically 2–4 roles). For `N ≤ 10`, exhaustive cycle enumeration is computationally trivial.
+
+##### Resolution Strategies
+
+When the controller encounters conflicts at runtime (Type 6 or transient inconsistencies during scaling), it must choose a resolution strategy. Three candidates are considered:
+
+**Priority-based relaxation**
+
+Each `RoleRatioConstraint` carries an optional `priority` field (higher value = higher priority, default = 0). When constraints cannot all be satisfied simultaneously, the controller drops the lowest-priority constraints first until a feasible solution exists.
+
+```go
+type RoleRatioConstraint struct {
+    NumeratorRole   string            `json:"numeratorRole"`
+    DenominatorRole string            `json:"denominatorRole"`
+    MinRatio        resource.Quantity `json:"minRatio"`
+    MaxRatio        resource.Quantity `json:"maxRatio"`
+    // Priority determines enforcement order when constraints conflict at
+    // runtime. Higher values are enforced first. Default is 0.
+    // +optional
+    // +kubebuilder:default=0
+    Priority int32 `json:"priority,omitempty"`
+}
+```
+
+**Recommendation**: Use priority-based for runtime resolution, combined with fail-closed for admission-time detected conflicts. This ensures:
+
+- Statically detectable conflicts (Types 1–5) are rejected at admission — the user must fix the spec.
+- Runtime-only conflicts (Type 6, transient states) are handled gracefully via priority relaxation.
+- The controller always reports which constraints were relaxed in `status.disaggregatedStatus.ratioStatuses`.
 
 #### Migration
 
