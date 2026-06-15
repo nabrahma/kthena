@@ -129,7 +129,8 @@ func TestSchedulerPluginGPUCacheUsage(t *testing.T) {
 			gpuCacheUsageLoadConcurrency, gpuCacheUsageLoadMaxTokens)
 		t.Cleanup(stopLoad)
 	}
-	waitForGPUCacheUsageSeparation(t, testCtx.KubeClient, kthenaNamespace, busyPods, idlePod)
+	waitForMockPodKVCacheSeparation(t, busyPods, idlePod)
+	time.Sleep(3 * time.Second) // allow router to scrape updated mock metrics before probe traffic
 
 	since := metav1.NewTime(time.Now())
 	utils.SendRouterChatRequests(t, chatURL, model, "kthena-router-plugin-e2e-fixed-prompt-gpu-usage-route", 200)
