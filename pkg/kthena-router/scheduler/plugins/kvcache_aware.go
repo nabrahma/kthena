@@ -336,7 +336,7 @@ func (t *KVCacheAware) calculatePodScores(blockHashes []uint64, blockToPods map[
 	return podScores
 }
 
-// calculatePodScoresAndMatch also returns the longest block match length, used for the blocks_matched metric.
+// calculatePodScoresAndMatch also returns the longest block match length, used for the match_ratio metric.
 func (t *KVCacheAware) calculatePodScoresAndMatch(blockHashes []uint64, blockToPods map[uint64][]string) (map[string]int, int) {
 	podScores := make(map[string]int)
 
