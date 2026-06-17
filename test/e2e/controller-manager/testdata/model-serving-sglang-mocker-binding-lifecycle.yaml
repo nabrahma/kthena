@@ -19,8 +19,12 @@ spec:
           spec:
             containers:
               - name: leader
-                image: ghcr.io/faust-benchou/dynamo-mocker-sglang:v2026-04-23
+                image: ghcr.io/faust-benchou/sglang-inference-sim:0.1.1
                 imagePullPolicy: IfNotPresent
+                args:
+                  - "--port=30000"
+                  - "--model=$(MODEL_NAME)"
+                  - "--mode=echo"
                 ports:
                   - name: metrics
                     containerPort: 30000
