@@ -17,14 +17,17 @@ spec:
                 image: ghcr.io/faust-benchou/sglang-inference-sim:0.1.1
                 imagePullPolicy: IfNotPresent
                 args:
-                  - "--port=30000"
-                  - "--model=$(MODEL_NAME)"
-                  - "--disaggregation-mode=prefill"
-                env:
-                  - name: MODEL_NAME
-                    value: "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
+                  - --model=deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B
+                  - --port=30000
+                  - --disaggregation-mode=prefill
                 ports:
                   - containerPort: 30000
+                readinessProbe:
+                  httpGet:
+                    path: /health
+                    port: 30000
+                  initialDelaySeconds: 2
+                  periodSeconds: 2
         workerReplicas: 0
       - name: decode
         replicas: 1
@@ -35,12 +38,15 @@ spec:
                 image: ghcr.io/faust-benchou/sglang-inference-sim:0.1.1
                 imagePullPolicy: IfNotPresent
                 args:
-                  - "--port=30000"
-                  - "--model=$(MODEL_NAME)"
-                  - "--disaggregation-mode=decode"
-                env:
-                  - name: MODEL_NAME
-                    value: "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
+                  - --model=deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B
+                  - --port=30000
+                  - --disaggregation-mode=decode
                 ports:
                   - containerPort: 30000
+                readinessProbe:
+                  httpGet:
+                    path: /health
+                    port: 30000
+                  initialDelaySeconds: 2
+                  periodSeconds: 2
         workerReplicas: 0

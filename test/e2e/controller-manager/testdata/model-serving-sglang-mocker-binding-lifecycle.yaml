@@ -22,13 +22,18 @@ spec:
                 image: ghcr.io/faust-benchou/sglang-inference-sim:0.1.1
                 imagePullPolicy: IfNotPresent
                 args:
-                  - "--port=30000"
-                  - "--model=$(MODEL_NAME)"
-                  - "--mode=echo"
+                  - --model=Qwen/Qwen3-8B
+                  - --port=30000
+                  - --mode=echo
+                  - --time-to-first-token=0ms
+                  - --inter-token-latency=0ms
                 ports:
                   - name: metrics
                     containerPort: 30000
-                env:
-                  - name: MODEL_NAME
-                    value: "Qwen/Qwen3-8B"
+                readinessProbe:
+                  httpGet:
+                    path: /health
+                    port: 30000
+                  initialDelaySeconds: 2
+                  periodSeconds: 2
         workerReplicas: 0
