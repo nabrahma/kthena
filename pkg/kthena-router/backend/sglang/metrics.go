@@ -55,20 +55,20 @@ var (
 )
 
 type sglangEngine struct {
-	// The address of sglang's query metrics is http://{model server}:MetricPort/metrics
-	// Default is 30000
-	MetricPort uint32
+	// The address of sglang's query metrics is http://{model server}:port/metrics
+	// Default is 30000 if not specified
+
 }
 
 func NewSglangEngine() *sglangEngine {
-	// TODO: Get MetricsPort from sglang configuration
-	return &sglangEngine{
-		MetricPort: 30000,
-	}
+	return &sglangEngine{}
 }
 
-func (engine *sglangEngine) GetPodMetrics(pod *corev1.Pod) (map[string]*dto.MetricFamily, error) {
-	url := metrics.PodEndpointURL(pod.Status.PodIP, engine.MetricPort, "/metrics")
+func (engine *sglangEngine) GetPodMetrics(pod *corev1.Pod, port uint32) (map[string]*dto.MetricFamily, error) {
+	if port == 0 {
+		port = 30000
+	}
+	url := metrics.PodEndpointURL(pod.Status.PodIP, port, "/metrics")
 	allMetrics, err := metrics.ParseMetricsURL(url)
 	if err != nil {
 		return nil, err
@@ -118,6 +118,9 @@ func (engine *sglangEngine) GetHistogramPodMetrics(allMetrics map[string]*dto.Me
 }
 
 // GetPodModels retrieves the list of models from a pod running the sglang engine.
-func (engine *sglangEngine) GetPodModels(pod *corev1.Pod) ([]string, error) {
-	return vllm.FetchPodModels(pod.Status.PodIP, engine.MetricPort)
+func (engine *sglangEngine) GetPodModels(pod *corev1.Pod, port uint32) ([]string, error) {
+	if port == 0 {
+		port = 30000
+	}
+	return vllm.FetchPodModels(pod.Status.PodIP, port)
 }

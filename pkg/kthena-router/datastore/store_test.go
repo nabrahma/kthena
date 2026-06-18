@@ -235,7 +235,11 @@ func TestStoreUpdatePodMetrics(t *testing.T) {
 	sum2 := float64(2)
 	count2 := uint64(2)
 	podinfo := PodInfo{
-		Pod:    &corev1.Pod{},
+		Pod: &corev1.Pod{
+			Status: corev1.PodStatus{
+				PodIP: "10.0.0.1",
+			},
+		},
 		engine: "vLLM",
 		TimePerOutputToken: &dto.Histogram{
 			SampleSum:   &sum1,
@@ -259,7 +263,7 @@ func TestStoreUpdatePodMetrics(t *testing.T) {
 		pods:        sync.Map{},
 		modelServer: sync.Map{},
 		podRuntimeInspector: &fakePodRuntimeInspector{
-			metricsFn: func(_ string, _ *corev1.Pod, _ map[string]*dto.Histogram) (map[string]float64, map[string]*dto.Histogram) {
+			metricsFn: func(_ string, _ *corev1.Pod, _ uint32, _ map[string]*dto.Histogram) (map[string]float64, map[string]*dto.Histogram) {
 				return map[string]float64{
 						utils.KVCacheUsage:      0.8,
 						utils.RequestWaitingNum: 15,
@@ -1533,26 +1537,26 @@ func TestStoreMatchModelServer(t *testing.T) {
 }
 
 type fakePodRuntimeInspector struct {
-	metricsFn    func(string, *corev1.Pod, map[string]*dto.Histogram) (map[string]float64, map[string]*dto.Histogram)
-	modelsFn     func(string, *corev1.Pod) ([]string, error)
+	metricsFn    func(string, *corev1.Pod, uint32, map[string]*dto.Histogram) (map[string]float64, map[string]*dto.Histogram)
+	modelsFn     func(string, *corev1.Pod, uint32) ([]string, error)
 	metricsCalls atomic.Int64
 	modelsCalls  atomic.Int64
 }
 
-func (f *fakePodRuntimeInspector) GetPodMetrics(engine string, pod *corev1.Pod, previousHistogram map[string]*dto.Histogram) (map[string]float64, map[string]*dto.Histogram) {
+func (f *fakePodRuntimeInspector) GetPodMetrics(engine string, pod *corev1.Pod, port uint32, previousHistogram map[string]*dto.Histogram) (map[string]float64, map[string]*dto.Histogram) {
 	f.metricsCalls.Add(1)
 	if f.metricsFn == nil {
 		return nil, nil
 	}
-	return f.metricsFn(engine, pod, previousHistogram)
+	return f.metricsFn(engine, pod, port, previousHistogram)
 }
 
-func (f *fakePodRuntimeInspector) GetPodModels(engine string, pod *corev1.Pod) ([]string, error) {
+func (f *fakePodRuntimeInspector) GetPodModels(engine string, pod *corev1.Pod, port uint32) ([]string, error) {
 	f.modelsCalls.Add(1)
 	if f.modelsFn == nil {
 		return nil, nil
 	}
-	return f.modelsFn(engine, pod)
+	return f.modelsFn(engine, pod, port)
 }
 
 func newStore(inspector ...PodRuntimeInspector) *store {
@@ -1670,19 +1674,25 @@ func TestAddOrUpdatePod_MetricsPreservedOnUpdate(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			inspector := &fakePodRuntimeInspector{
-				metricsFn: func(_ string, _ *corev1.Pod, _ map[string]*dto.Histogram) (map[string]float64, map[string]*dto.Histogram) {
+				metricsFn: func(_ string, _ *corev1.Pod, _ uint32, _ map[string]*dto.Histogram) (map[string]float64, map[string]*dto.Histogram) {
 					return tc.initialMetrics, tc.initialHist
 				},
-				modelsFn: func(_ string, _ *corev1.Pod) ([]string, error) {
+				modelsFn: func(_ string, _ *corev1.Pod, _ uint32) ([]string, error) {
 					return tc.initialModels, nil
 				},
 			}
 			s := newStore(inspector)
 
 			ms := createTestModelServer("default", "ms1", aiv1alpha1.VLLM)
+			ms.Spec.WorkloadPort.Port = 8000
 			s.AddOrUpdateModelServer(ms, sets.New[types.NamespacedName]())
 
 			pod := createTestPod("default", "pod1")
+			pod.Status.PodIP = "10.0.0.1"
+			if pod.Annotations == nil {
+				pod.Annotations = make(map[string]string)
+			}
+			pod.Annotations["kthena.io/engine"] = "vLLM"
 			err := s.AddOrUpdatePod(pod, []*aiv1alpha1.ModelServer{ms})
 			assert.NoError(t, err)
 			assert.Equal(t, int64(1), inspector.metricsCalls.Load(), "backend metrics should be fetched on initial pod add")
@@ -1734,22 +1744,28 @@ func TestAddOrUpdatePod_MetricsPreservedOnUpdate(t *testing.T) {
 
 func TestAddOrUpdatePod_NewPodStillFetchesMetrics(t *testing.T) {
 	inspector := &fakePodRuntimeInspector{
-		metricsFn: func(_ string, _ *corev1.Pod, _ map[string]*dto.Histogram) (map[string]float64, map[string]*dto.Histogram) {
+		metricsFn: func(_ string, _ *corev1.Pod, _ uint32, _ map[string]*dto.Histogram) (map[string]float64, map[string]*dto.Histogram) {
 			return map[string]float64{
 				utils.KVCacheUsage:      0.3,
 				utils.RequestRunningNum: 2,
 			}, map[string]*dto.Histogram{}
 		},
-		modelsFn: func(_ string, _ *corev1.Pod) ([]string, error) {
+		modelsFn: func(_ string, _ *corev1.Pod, _ uint32) ([]string, error) {
 			return []string{"base-model"}, nil
 		},
 	}
 	s := newStore(inspector)
 
 	ms := createTestModelServer("default", "ms1", aiv1alpha1.VLLM)
+	ms.Spec.WorkloadPort.Port = 8000
 	s.AddOrUpdateModelServer(ms, sets.New[types.NamespacedName]())
 
 	pod := createTestPod("default", "fresh-pod")
+	pod.Status.PodIP = "10.0.0.1"
+	if pod.Annotations == nil {
+		pod.Annotations = make(map[string]string)
+	}
+	pod.Annotations["kthena.io/engine"] = "vLLM"
 	err := s.AddOrUpdatePod(pod, []*aiv1alpha1.ModelServer{ms})
 	assert.NoError(t, err)
 
@@ -1763,7 +1779,7 @@ func TestAddOrUpdatePod_NewPodStillFetchesMetrics(t *testing.T) {
 
 func TestAddOrUpdatePod_ModelServerChangePreservesMetrics(t *testing.T) {
 	inspector := &fakePodRuntimeInspector{
-		metricsFn: func(_ string, _ *corev1.Pod, _ map[string]*dto.Histogram) (map[string]float64, map[string]*dto.Histogram) {
+		metricsFn: func(_ string, _ *corev1.Pod, _ uint32, _ map[string]*dto.Histogram) (map[string]float64, map[string]*dto.Histogram) {
 			return map[string]float64{
 				utils.KVCacheUsage:      0.6,
 				utils.RequestWaitingNum: 5,
@@ -1772,18 +1788,25 @@ func TestAddOrUpdatePod_ModelServerChangePreservesMetrics(t *testing.T) {
 				utils.TTFT:              0.2,
 			}, map[string]*dto.Histogram{}
 		},
-		modelsFn: func(_ string, _ *corev1.Pod) ([]string, error) {
+		modelsFn: func(_ string, _ *corev1.Pod, _ uint32) ([]string, error) {
 			return []string{"model-a"}, nil
 		},
 	}
 	s := newStore(inspector)
 
 	ms1 := createTestModelServer("default", "ms1", aiv1alpha1.VLLM)
+	ms1.Spec.WorkloadPort.Port = 8000
 	ms2 := createTestModelServer("default", "ms2", aiv1alpha1.VLLM)
+	ms2.Spec.WorkloadPort.Port = 8000
 	s.AddOrUpdateModelServer(ms1, sets.New[types.NamespacedName]())
 	s.AddOrUpdateModelServer(ms2, sets.New[types.NamespacedName]())
 
 	pod := createTestPod("default", "pod1")
+	pod.Status.PodIP = "10.0.0.1"
+	if pod.Annotations == nil {
+		pod.Annotations = make(map[string]string)
+	}
+	pod.Annotations["kthena.io/engine"] = "vLLM"
 	err := s.AddOrUpdatePod(pod, []*aiv1alpha1.ModelServer{ms1})
 	assert.NoError(t, err)
 	assert.Equal(t, int64(1), inspector.metricsCalls.Load(), "backend metrics should be fetched on initial pod add")

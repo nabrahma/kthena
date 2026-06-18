@@ -140,18 +140,18 @@ type CallbackFunc func(data EventData)
 
 // PodRuntimeInspector fetches runtime metrics and loaded models for a pod.
 type PodRuntimeInspector interface {
-	GetPodMetrics(engine string, pod *corev1.Pod, previousHistogram map[string]*dto.Histogram) (map[string]float64, map[string]*dto.Histogram)
-	GetPodModels(engine string, pod *corev1.Pod) ([]string, error)
+	GetPodMetrics(engine string, pod *corev1.Pod, port uint32, previousHistogram map[string]*dto.Histogram) (map[string]float64, map[string]*dto.Histogram)
+	GetPodModels(engine string, pod *corev1.Pod, port uint32) ([]string, error)
 }
 
 type realPodRuntimeInspector struct{}
 
-func (realPodRuntimeInspector) GetPodMetrics(engine string, pod *corev1.Pod, previousHistogram map[string]*dto.Histogram) (map[string]float64, map[string]*dto.Histogram) {
-	return backend.GetPodMetrics(engine, pod, previousHistogram)
+func (realPodRuntimeInspector) GetPodMetrics(engine string, pod *corev1.Pod, port uint32, previousHistogram map[string]*dto.Histogram) (map[string]float64, map[string]*dto.Histogram) {
+	return backend.GetPodMetrics(engine, pod, port, previousHistogram)
 }
 
-func (realPodRuntimeInspector) GetPodModels(engine string, pod *corev1.Pod) ([]string, error) {
-	return backend.GetPodModels(engine, pod)
+func (realPodRuntimeInspector) GetPodModels(engine string, pod *corev1.Pod, port uint32) ([]string, error) {
+	return backend.GetPodModels(engine, pod, port)
 }
 
 type Option func(*store)
@@ -1348,8 +1348,12 @@ func (s *store) updatePodMetrics(pod *PodInfo) {
 		return
 	}
 
+	if podObj.Status.PodIP == "" {
+		return
+	}
+	port := s.getPodWorkloadPort(pod)
 	previousHistogram := getPreviousHistogram(pod)
-	gaugeMetrics, histogramMetrics := s.getPodRuntimeInspector().GetPodMetrics(engine, podObj, previousHistogram)
+	gaugeMetrics, histogramMetrics := s.getPodRuntimeInspector().GetPodMetrics(engine, podObj, port, previousHistogram)
 	if gaugeMetrics != nil {
 		updateGaugeMetricsInfo(pod, gaugeMetrics)
 	}
@@ -1370,13 +1374,30 @@ func (s *store) updatePodModels(podInfo *PodInfo) {
 		return
 	}
 
-	models, err := s.getPodRuntimeInspector().GetPodModels(engine, podObj)
+	if podObj.Status.PodIP == "" {
+		return
+	}
+	port := s.getPodWorkloadPort(podInfo)
+	models, err := s.getPodRuntimeInspector().GetPodModels(engine, podObj, port)
 	if err != nil {
 		klog.V(4).Infof("failed to get models of pod %s/%s: %v", podObj.GetNamespace(), podObj.GetName(), err)
 		return
 	}
 
 	podInfo.UpdateModels(models)
+}
+
+func (s *store) getPodWorkloadPort(podInfo *PodInfo) uint32 {
+	modelServers := podInfo.GetModelServers()
+	for msName := range modelServers {
+		if msValue, ok := s.modelServer.Load(msName); ok {
+			ms := msValue.(*modelServer).getModelServer()
+			if ms != nil && ms.Spec.WorkloadPort.Port > 0 {
+				return uint32(ms.Spec.WorkloadPort.Port)
+			}
+		}
+	}
+	return 0
 }
 
 func getPreviousHistogram(podinfo *PodInfo) map[string]*dto.Histogram {
