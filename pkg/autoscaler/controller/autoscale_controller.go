@@ -326,31 +326,43 @@ func (ac *AutoscaleController) doDisaggregatedScale(ctx context.Context, autosca
 	disaggregatedScaler, ok := ac.disaggregatedScalerMap[key]
 	if !ok || disaggregatedScaler.NeedUpdate(autoscalePolicy) {
 		disaggregatedScaler = autoscaler.NewDisaggregatedAutoscaler(autoscalePolicy)
+		if disaggregatedScaler == nil {
+			return fmt.Errorf("failed to create disaggregated scaler: policy or target is nil")
+		}
 		ac.disaggregatedScalerMap[key] = disaggregatedScaler
 		klog.Infof("asp: %s changed, create new disaggregated scaler", autoscalePolicy.Name)
 	}
 
 	modelServing, err := ac.getDisaggregatedTargetModelServing(target, autoscalePolicy.Namespace)
 	if err != nil {
-		ac.updateDisaggregatedPolicyStatus(ctx, autoscalePolicy, nil, err)
+		if err := ac.updateDisaggregatedPolicyStatus(ctx, autoscalePolicy, nil, err, false); err != nil {
+			klog.Warningf("failed to update disaggregated autoscaling policy status %s/%s: %v", autoscalePolicy.Namespace, autoscalePolicy.Name, err)
+		}
 		return err
 	}
 	currentReplicas, err := getCurrentRoleReplicas(modelServing, target.Roles)
 	if err != nil {
-		ac.updateDisaggregatedPolicyStatus(ctx, autoscalePolicy, nil, err)
+		if err := ac.updateDisaggregatedPolicyStatus(ctx, autoscalePolicy, nil, err, false); err != nil {
+			klog.Warningf("failed to update disaggregated autoscaling policy status %s/%s: %v", autoscalePolicy.Namespace, autoscalePolicy.Name, err)
+		}
 		return err
 	}
 
 	result, err := disaggregatedScaler.Scale(ctx, ac.podsLister, autoscalePolicy, currentReplicas)
 	if err != nil {
-		ac.updateDisaggregatedPolicyStatus(ctx, autoscalePolicy, nil, err)
+		if err := ac.updateDisaggregatedPolicyStatus(ctx, autoscalePolicy, nil, err, true); err != nil {
+			klog.Warningf("failed to update disaggregated autoscaling policy status %s/%s: %v", autoscalePolicy.Namespace, autoscalePolicy.Name, err)
+		}
+
 		return err
 	}
 	if err := ac.updateTargetRoleReplicas(ctx, target, autoscalePolicy.Namespace, finalReplicasByRole(result.Roles)); err != nil {
-		ac.updateDisaggregatedPolicyStatus(ctx, autoscalePolicy, result, err)
+		if err := ac.updateDisaggregatedPolicyStatus(ctx, autoscalePolicy, result, err, true); err != nil {
+			klog.Warningf("failed to update disaggregated autoscaling policy status %s/%s: %v", autoscalePolicy.Namespace, autoscalePolicy.Name, err)
+		}
 		return err
 	}
-	if err := ac.updateDisaggregatedPolicyStatus(ctx, autoscalePolicy, result, nil); err != nil {
+	if err := ac.updateDisaggregatedPolicyStatus(ctx, autoscalePolicy, result, nil, true); err != nil {
 		klog.Warningf("failed to update disaggregated autoscaling policy status %s/%s: %v", autoscalePolicy.Namespace, autoscalePolicy.Name, err)
 	}
 	return nil
@@ -385,6 +397,10 @@ func (ac *AutoscaleController) getDisaggregatedTargetModelServing(target *worklo
 // getCurrentRoleReplicas returns the current replica count for every role named
 // in the policy. A nil role.replicas uses the API default of 1.
 func getCurrentRoleReplicas(modelServing *workload.ModelServing, roleParams map[string]workload.RoleScalingParam) (map[string]int32, error) {
+	if modelServing == nil {
+		return nil, fmt.Errorf("modelServing is nil")
+	}
+
 	roleReplicas := make(map[string]int32, len(roleParams))
 	for _, role := range modelServing.Spec.Template.Roles {
 		if _, needed := roleParams[role.Name]; !needed {
@@ -407,9 +423,9 @@ func getCurrentRoleReplicas(modelServing *workload.ModelServing, roleParams map[
 // jsonPatchOperation is the minimal JSON Patch operation used to update only
 // role replica fields and avoid serializing resource/template fields.
 type jsonPatchOperation struct {
-	Op    string `json:"op"`
-	Path  string `json:"path"`
-	Value int32  `json:"value"`
+	Op    string      `json:"op"`
+	Path  string      `json:"path"`
+	Value interface{} `json:"value"`
 }
 
 // updateTargetRoleReplicas patches all changed role replicas atomically. It uses
@@ -421,25 +437,21 @@ func (ac *AutoscaleController) updateTargetRoleReplicas(ctx context.Context, tar
 	}
 	patches := make([]jsonPatchOperation, 0, len(desiredReplicas))
 	for roleName, desired := range desiredReplicas {
-		index := -1
-		current := int32(1)
-		for i, role := range modelServing.Spec.Template.Roles {
-			if role.Name != roleName {
-				continue
-			}
-			index = i
-			if role.Replicas != nil {
-				current = *role.Replicas
-			}
-			break
-		}
-		if index < 0 {
+		roleIndex, current, found := getRoleReplica(modelServing, roleName)
+		if !found {
 			return fmt.Errorf("role %s not found in model serving %s/%s", roleName, modelServing.Namespace, modelServing.Name)
 		}
 		if current == desired {
 			continue
 		}
-		patches = append(patches, jsonPatchOperation{Op: "add", Path: fmt.Sprintf("/spec/template/roles/%d/replicas", index), Value: desired})
+		// Guard the array index with a JSON Patch test operation. The role index is
+		// resolved from the informer cache, so the live object could be reordered by
+		// another writer before the patch reaches the API server. If that happens,
+		// the test fails atomically and prevents changing replicas on the wrong role.
+		patches = append(patches,
+			jsonPatchOperation{Op: "test", Path: fmt.Sprintf("/spec/template/roles/%d/name", roleIndex), Value: roleName},
+			jsonPatchOperation{Op: "add", Path: fmt.Sprintf("/spec/template/roles/%d/replicas", roleIndex), Value: desired},
+		)
 	}
 	if len(patches) == 0 {
 		return nil
@@ -453,10 +465,24 @@ func (ac *AutoscaleController) updateTargetRoleReplicas(ctx context.Context, tar
 	return err
 }
 
+func getRoleReplica(modelServing *workload.ModelServing, roleName string) (int, int32, bool) {
+	for i, role := range modelServing.Spec.Template.Roles {
+		if role.Name != roleName {
+			continue
+		}
+		replicas := int32(1)
+		if role.Replicas != nil {
+			replicas = *role.Replicas
+		}
+		return i, replicas, true
+	}
+	return -1, 0, false
+}
+
 // updateDisaggregatedPolicyStatus writes status for the last disaggregated
-// reconcile. The status includes metric-derived desired replicas, final patched
-// replicas, ratio status, and high-level Ready/TargetFound conditions.
-func (ac *AutoscaleController) updateDisaggregatedPolicyStatus(ctx context.Context, policy *workload.AutoscalingPolicy, result *autoscaler.DisaggregatedScaleResult, reconcileErr error) error {
+// reconcile. Ready reports the overall reconcile result, while TargetFound only
+// reports whether the referenced ModelServing and configured roles were resolved.
+func (ac *AutoscaleController) updateDisaggregatedPolicyStatus(ctx context.Context, policy *workload.AutoscalingPolicy, result *autoscaler.DisaggregatedScaleResult, reconcileErr error, targetFound bool) error {
 	policyCopy := policy.DeepCopy()
 	policyCopy.Status.ObservedGeneration = policy.Generation
 	policyCopy.Status.HomogeneousStatus = nil
@@ -477,16 +503,23 @@ func (ac *AutoscaleController) updateDisaggregatedPolicyStatus(ctx context.Conte
 		readyCondition.Status = metav1.ConditionFalse
 		readyCondition.Reason = "ReconcileFailed"
 		readyCondition.Message = reconcileErr.Error()
-		targetFoundCondition.Status = metav1.ConditionFalse
-		targetFoundCondition.Reason = "TargetInvalid"
-		targetFoundCondition.Message = reconcileErr.Error()
 	} else {
 		readyCondition.Status = metav1.ConditionTrue
 		readyCondition.Reason = "Reconciled"
 		readyCondition.Message = "disaggregated autoscaling policy reconciled"
+	}
+	if targetFound {
 		targetFoundCondition.Status = metav1.ConditionTrue
 		targetFoundCondition.Reason = "TargetFound"
 		targetFoundCondition.Message = "target model serving and roles found"
+	} else {
+		targetFoundCondition.Status = metav1.ConditionFalse
+		targetFoundCondition.Reason = "TargetInvalid"
+		if reconcileErr != nil {
+			targetFoundCondition.Message = reconcileErr.Error()
+		} else {
+			targetFoundCondition.Message = "target model serving or configured roles were not found"
+		}
 	}
 	meta.SetStatusCondition(&policyCopy.Status.Conditions, readyCondition)
 	meta.SetStatusCondition(&policyCopy.Status.Conditions, targetFoundCondition)
@@ -496,12 +529,12 @@ func (ac *AutoscaleController) updateDisaggregatedPolicyStatus(ctx context.Conte
 		now := metav1.Now()
 		for _, role := range result.Roles {
 			var lastScaleTime *metav1.Time
-			if role.CurrentReplicas != role.FinalReplicas {
+			if reconcileErr == nil && role.CurrentReplicas != role.FinalReplicas {
 				lastScaleTime = &now
 			}
 			roleStatuses = append(roleStatuses, workload.TargetScalingStatus{
 				Name:            role.Name,
-				CurrentReplicas: role.FinalReplicas,
+				CurrentReplicas: role.CurrentReplicas,
 				DesiredReplicas: role.DesiredReplicas,
 				Mode:            role.Mode,
 				LastScaleTime:   lastScaleTime,

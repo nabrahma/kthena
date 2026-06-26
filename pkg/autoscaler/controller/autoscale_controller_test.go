@@ -325,6 +325,13 @@ func TestDoDisaggregatedScale_RatioRaisesDecode(t *testing.T) {
 	if updatedPolicy.Status.DisaggregatedStatus.RatioStatus == nil || updatedPolicy.Status.DisaggregatedStatus.RatioStatus.CurrentRatio != "1" {
 		t.Fatalf("expected current ratio 1, got %#v", updatedPolicy.Status.DisaggregatedStatus.RatioStatus)
 	}
+	statusByRole := map[string]workload.TargetScalingStatus{}
+	for _, roleStatus := range updatedPolicy.Status.DisaggregatedStatus.Roles {
+		statusByRole[roleStatus.Name] = roleStatus
+	}
+	if statusByRole["prefill"].CurrentReplicas != 1 || statusByRole["decode"].CurrentReplicas != 2 {
+		t.Fatalf("expected status current replicas to reflect observed replicas before patch, got %#v", statusByRole)
+	}
 }
 
 func TestUpdateTargetRoleReplicas_UsesMinimalJSONPatch(t *testing.T) {
@@ -376,6 +383,67 @@ func TestUpdateTargetRoleReplicas_UsesMinimalJSONPatch(t *testing.T) {
 	if !strings.Contains(patchBody, "/spec/template/roles/0/replicas") || !strings.Contains(patchBody, "/spec/template/roles/1/replicas") {
 		t.Fatalf("patch body does not update both role replicas: %s", patchBody)
 	}
+
+	var patchOps []jsonPatchOperation
+	if err := json.Unmarshal(patchAction.GetPatch(), &patchOps); err != nil {
+		t.Fatalf("failed to unmarshal patch body: %v", err)
+	}
+	if len(patchOps) != 4 {
+		t.Fatalf("expected test+add operations for two roles, got %d operations: %#v", len(patchOps), patchOps)
+	}
+	if patchOps[0].Op != "test" || patchOps[0].Path != "/spec/template/roles/0/name" || patchOps[0].Value != "prefill" {
+		t.Fatalf("expected first operation to test prefill role name, got %#v", patchOps[0])
+	}
+	if patchOps[2].Op != "test" || patchOps[2].Path != "/spec/template/roles/1/name" || patchOps[2].Value != "decode" {
+		t.Fatalf("expected third operation to test decode role name, got %#v", patchOps[2])
+	}
+}
+
+func TestUpdateDisaggregatedPolicyStatus_TargetFoundIndependentFromReady(t *testing.T) {
+	ns := "default"
+	policy := &workload.AutoscalingPolicy{ObjectMeta: metav1.ObjectMeta{Name: "ap", Namespace: ns, Generation: 1}}
+	fakeClient := clientfake.NewSimpleClientset(policy.DeepCopy())
+	ac := &AutoscaleController{client: fakeClient}
+
+	if err := ac.updateDisaggregatedPolicyStatus(context.Background(), policy, nil, fmt.Errorf("metric collection failed"), true); err != nil {
+		t.Fatalf("updateDisaggregatedPolicyStatus error: %v", err)
+	}
+	updated, err := fakeClient.WorkloadV1alpha1().AutoscalingPolicies(ns).Get(context.Background(), "ap", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get updated policy error: %v", err)
+	}
+	ready := findPolicyCondition(updated.Status.Conditions, "Ready")
+	if ready == nil || ready.Status != metav1.ConditionFalse || ready.Reason != "ReconcileFailed" {
+		t.Fatalf("expected Ready=False/ReconcileFailed, got %#v", ready)
+	}
+	targetFound := findPolicyCondition(updated.Status.Conditions, "TargetFound")
+	if targetFound == nil || targetFound.Status != metav1.ConditionTrue || targetFound.Reason != "TargetFound" {
+		t.Fatalf("expected TargetFound=True when target was resolved despite reconcile error, got %#v", targetFound)
+	}
+
+	policy = &workload.AutoscalingPolicy{ObjectMeta: metav1.ObjectMeta{Name: "ap-missing", Namespace: ns, Generation: 1}}
+	fakeClient = clientfake.NewSimpleClientset(policy.DeepCopy())
+	ac = &AutoscaleController{client: fakeClient}
+	if err := ac.updateDisaggregatedPolicyStatus(context.Background(), policy, nil, fmt.Errorf("role decode not found"), false); err != nil {
+		t.Fatalf("updateDisaggregatedPolicyStatus missing target error: %v", err)
+	}
+	updated, err = fakeClient.WorkloadV1alpha1().AutoscalingPolicies(ns).Get(context.Background(), "ap-missing", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get updated missing policy error: %v", err)
+	}
+	targetFound = findPolicyCondition(updated.Status.Conditions, "TargetFound")
+	if targetFound == nil || targetFound.Status != metav1.ConditionFalse || targetFound.Reason != "TargetInvalid" {
+		t.Fatalf("expected TargetFound=False/TargetInvalid when target or role resolution failed, got %#v", targetFound)
+	}
+}
+
+func findPolicyCondition(conditions []metav1.Condition, conditionType string) *metav1.Condition {
+	for i := range conditions {
+		if conditions[i].Type == conditionType {
+			return &conditions[i]
+		}
+	}
+	return nil
 }
 
 func TestFormatAutoscalerMapKey_IncludesNamespaceAndTarget(t *testing.T) {

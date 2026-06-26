@@ -78,6 +78,9 @@ type DisaggregatedScaleResult struct {
 // entry in the scaler metadata for status and ratio enforcement, but their
 // metric target map is empty and Scale will skip collection for them.
 func NewDisaggregatedAutoscaler(policy *workload.AutoscalingPolicy) *DisaggregatedAutoscaler {
+	if policy == nil || policy.Spec.DisaggregatedTarget == nil {
+		return nil
+	}
 	metricTargetsByRole := GetDisaggregatedMetricTargets(policy)
 	collectors := make(map[string]*MetricCollector, len(policy.Spec.DisaggregatedTarget.Roles))
 	statuses := make(map[string]*Status, len(policy.Spec.DisaggregatedTarget.Roles))
@@ -122,6 +125,10 @@ func (autoscaler *DisaggregatedAutoscaler) NeedUpdate(policy *workload.Autoscali
 // ratio enforcement, while FinalReplicas is the value that should be patched to
 // ModelServing.spec.template.roles[*].replicas.
 func (autoscaler *DisaggregatedAutoscaler) Scale(ctx context.Context, podLister listerv1.PodLister, policy *workload.AutoscalingPolicy, currentReplicas map[string]int32) (*DisaggregatedScaleResult, error) {
+	if autoscaler == nil || autoscaler.Meta == nil || autoscaler.Meta.Config == nil {
+		return nil, fmt.Errorf("scaler is not properly initialized")
+	}
+
 	correctedReplicas := make(map[string]int32, len(autoscaler.Meta.Config.Roles))
 	desiredReplicas := make(map[string]int32, len(autoscaler.Meta.Config.Roles))
 	bounds := make(map[string]algorithm.ReplicaBounds, len(autoscaler.Meta.Config.Roles))
