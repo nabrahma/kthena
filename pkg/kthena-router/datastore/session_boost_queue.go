@@ -17,6 +17,7 @@ limitations under the License.
 package datastore
 
 import (
+	"container/heap"
 	"container/list"
 	"context"
 	"sync"
@@ -230,8 +231,17 @@ func (pq *RequestPriorityQueue) runBackpressureNoGrace(ctx context.Context, tick
 }
 
 // runBackpressureWithGrace handles the case where grace period is configured.
-// Does NOT listen on notifyCh in the main select to avoid racing with the grace
-// period logic on releaseCh. The ticker serves as the backstop for new arrivals.
+// The grace wait applies to release events (releaseCh): after a request completes,
+// we briefly hold the freed capacity to give the same session a chance to submit a
+// follow-up that can reuse the warm prefix cache. New arrivals (notifyCh) are
+// admitted immediately when capacity exists, so enabling grace does not add
+// admission latency to first turns on an idle queue.
+//
+// When both a fresh arrival and a release are pending, the release must win so the
+// just-freed slot is held for the grace period; Go's select picks randomly between
+// ready cases, so the notifyCh branch drains any pending release and routes it
+// through the grace path to keep that ordering deterministic. The ticker remains a
+// backstop.
 func (pq *RequestPriorityQueue) runBackpressureWithGrace(ctx context.Context, ticker *time.Ticker) {
 	for {
 		select {
@@ -241,6 +251,17 @@ func (pq *RequestPriorityQueue) runBackpressureWithGrace(ctx context.Context, ti
 			return
 		case <-pq.releaseCh:
 			pq.waitGraceAndDequeue(ctx)
+		case <-pq.notifyCh:
+			// A fresh request arrived. If a release is also pending, prefer the
+			// grace path so the freed slot is held briefly for a same-session
+			// follow-up; otherwise admit immediately so an idle queue need not wait
+			// for the next ticker tick.
+			select {
+			case <-pq.releaseCh:
+				pq.waitGraceAndDequeue(ctx)
+			default:
+				pq.tryBackpressureDequeue(ctx)
+			}
 		case <-ticker.C:
 			pq.tryBackpressureDequeue(ctx)
 		}
@@ -290,6 +311,45 @@ func (pq *RequestPriorityQueue) waitGraceAndDequeue(ctx context.Context) {
 	}
 }
 
+// drainCancelledLocked removes cancelled/timed-out requests from anywhere in the
+// heap, decrements queue-size metrics for each, and rebuilds the heap. The caller
+// must hold pq.mu. It returns the number of requests drained.
+//
+// This is needed because while all backends report busy (or the inflight limit is
+// reached), popWhenAvailable is never called, so requests whose CancelCh has fired
+// would otherwise linger in the heap and keep the reported queue size inflated
+// until capacity returns. Draining them here keeps the queue size accurate and
+// avoids wasting a future dequeue slot on an already-dead request. The waiting
+// caller detects cancellation via its own request-scoped signal, so we deliberately
+// do not close NotifyChan here.
+func (pq *RequestPriorityQueue) drainCancelledLocked() int {
+	origLen := len(pq.heap)
+	if origLen == 0 {
+		return 0
+	}
+	kept := pq.heap[:0]
+	for _, req := range pq.heap {
+		if req.isCancelled() {
+			pq.metricDecSize(req.ModelName, req.UserID)
+			pq.metricRecordDuration(req.ModelName, req.UserID, time.Since(req.RequestTime))
+			pq.metricIncCancelled(req.ModelName, req.UserID)
+			continue
+		}
+		kept = append(kept, req)
+	}
+	drained := origLen - len(kept)
+	if drained == 0 {
+		return 0
+	}
+	// Release references to the drained tail before shrinking the heap.
+	for i := len(kept); i < origLen; i++ {
+		pq.heap[i] = nil
+	}
+	pq.heap = kept
+	heap.Init(pq)
+	return drained
+}
+
 // tryBackpressureDequeue admits as many queued requests as possible in one pass,
 // stopping when the inflight limit is reached, backends report no capacity, or
 // the queue is empty. This avoids the one-request-per-tick bottleneck during
@@ -306,17 +366,21 @@ func (pq *RequestPriorityQueue) tryBackpressureDequeue(ctx context.Context) {
 		currentInflight := pq.inflightCount.Load()
 
 		if currentInflight >= maxInflight {
-			klog.V(4).Infof("[SessionBoost] backpressure: inflight limit reached, inflight=%d maxInflight=%d",
-				currentInflight, maxInflight)
+			pq.mu.Lock()
+			drained := pq.drainCancelledLocked()
+			pq.mu.Unlock()
+			klog.V(4).Infof("[SessionBoost] backpressure: inflight limit reached, inflight=%d maxInflight=%d drainedCancelled=%d",
+				currentInflight, maxInflight, drained)
 			return
 		}
 
 		if !pq.backendChecker() {
-			pq.mu.RLock()
+			pq.mu.Lock()
+			drained := pq.drainCancelledLocked()
 			queueLen := len(pq.heap)
-			pq.mu.RUnlock()
-			klog.V(4).Infof("[SessionBoost] backpressure: backend pods busy, holding dequeue. queueLen=%d inflight=%d",
-				queueLen, currentInflight)
+			pq.mu.Unlock()
+			klog.V(4).Infof("[SessionBoost] backpressure: backend pods busy, holding dequeue. queueLen=%d inflight=%d drainedCancelled=%d",
+				queueLen, currentInflight, drained)
 			return
 		}
 

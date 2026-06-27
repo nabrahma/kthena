@@ -233,6 +233,55 @@ func TestSessionBoostQueue_MultipleSessions(t *testing.T) {
 	}
 }
 
+func TestSessionBoostQueue_BackpressureDrainsCancelledWhenBusy(t *testing.T) {
+	// Backends are always busy, so tryBackpressureDequeue never pops. Cancelled
+	// requests must still be drained from the heap so the queue size does not stay
+	// inflated until capacity returns.
+	checker := func() bool { return false } // backends always busy
+
+	cfg := sessionBoostConfig()
+	cfg.SessionBoostGracePeriod = 0
+	cfg.BackpressurePollInterval = 10 * time.Millisecond
+	cfg.MaxConcurrent = 4
+	q := newSessionBoostQueue(cfg, checker)
+	defer q.Close()
+
+	now := time.Now()
+	// Two requests whose context is already cancelled, plus one live request.
+	cancelledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	cancelled1 := &Request{UserID: "c1", ModelName: "m", RequestTime: now, NotifyChan: make(chan struct{}), CancelCh: cancelledCtx.Done()}
+	cancelled2 := &Request{UserID: "c2", ModelName: "m", RequestTime: now.Add(time.Millisecond), NotifyChan: make(chan struct{}), CancelCh: cancelledCtx.Done()}
+	live := &Request{UserID: "live", ModelName: "m", RequestTime: now.Add(2 * time.Millisecond), NotifyChan: make(chan struct{})}
+
+	for _, r := range []*Request{cancelled1, cancelled2, live} {
+		if err := q.PushRequest(r); err != nil {
+			t.Fatalf("PushRequest failed: %v", err)
+		}
+	}
+	if got := q.Len(); got != 3 {
+		t.Fatalf("Expected queue length 3 before draining, got %d", got)
+	}
+
+	// One dequeue pass with backends busy: no request can be admitted, but the two
+	// cancelled requests must be drained from the heap, leaving only the live one.
+	q.tryBackpressureDequeue(context.Background())
+
+	if got := q.Len(); got != 1 {
+		t.Fatalf("Expected queue length 1 after draining cancelled requests, got %d", got)
+	}
+
+	// The remaining request must be the live one, and it must not have been admitted.
+	if q.heap[0].UserID != "live" {
+		t.Errorf("Expected remaining request to be 'live', got %q", q.heap[0].UserID)
+	}
+	select {
+	case <-live.NotifyChan:
+		t.Fatal("live request should not be admitted while backends are busy")
+	default:
+	}
+}
+
 func TestSessionBoostQueue_BackpressureMode(t *testing.T) {
 	backendHasCapacity := true
 	checker := func() bool { return backendHasCapacity }
