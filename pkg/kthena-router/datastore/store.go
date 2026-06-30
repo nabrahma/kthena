@@ -67,6 +67,9 @@ const (
 	defaultMetricsScrapeInterval = 1 * time.Second
 	metricsScrapeIntervalEnv     = "METRICS_SCRAPE_INTERVAL"
 
+	// maxConcurrentPodScrapes caps goroutines spawned per metrics scrape cycle.
+	maxConcurrentPodScrapes = 100
+
 	// onFlightSyncInterval caps Redis read traffic from SyncOnFlightCounts.
 	// At most one HMGET is issued per interval regardless of request rate;
 	// all other callers use the local atomic values maintained by Incr/Decr.
@@ -484,13 +487,26 @@ func (s *store) Run(ctx context.Context) {
 		ticker := time.NewTicker(s.metricsScrapeInterval)
 		defer ticker.Stop()
 		for {
+			var wg sync.WaitGroup
+			sem := make(chan struct{}, maxConcurrentPodScrapes)
 			s.pods.Range(func(key, value any) bool {
 				if p, ok := value.(*PodInfo); ok {
-					s.updatePodMetrics(p)
-					s.updatePodModels(p)
+					select {
+					case <-ctx.Done():
+						return false
+					case sem <- struct{}{}:
+					}
+					wg.Add(1)
+					go func(pod *PodInfo) {
+						defer wg.Done()
+						defer func() { <-sem }()
+						s.updatePodMetrics(pod)
+						s.updatePodModels(pod)
+					}(p)
 				}
 				return true
 			})
+			wg.Wait()
 			s.initialSynced.Store(true)
 			select {
 			case <-ctx.Done():
