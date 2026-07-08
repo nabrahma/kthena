@@ -21,7 +21,7 @@ Kthena v1.0.0 also includes an important autoscaling API consolidation. `Autosca
 - **AutoscalingPolicy consolidation and P/D coordinated disaggregated autoscaling:** `AutoscalingPolicyBinding` is removed, and autoscaling target configuration is consolidated into `AutoscalingPolicy`; `disaggregatedTarget` enables coordinated role-level autoscaling for prefill/decode workloads, allowing each role to scale from its own metrics while keeping P/D replica ratios within healthy bounds through optional ratio constraints.
 - **Session boost for multi-turn conversations:** The router can prioritize follow-up requests from recently completed sessions, improving the chance of reusing warm KV cache under concurrent agentic and chat workloads.
 - **Router scheduling and observability:** Per-pod in-flight request tracking, Redis-backed cross-router synchronization, configurable pod metrics scraping, and cache-aware Prometheus metrics improve scheduling accuracy and operational visibility.
-- **Role-level rolling update availability control:** Enhancements to `RoleRollingUpdate` feature. Now Per-role can set `maxUnavailable`, to control the pace of the upgrade.
+- **Role-level rolling update availability control:** Enhancements to the `RoleRollingUpdate` feature. Now each role can set `maxUnavailable` to control the pace of the upgrade.
 - **Gateway API and HTTPRoute correctness:** Kthena router now honors HTTPRoute hostnames, keeps matched route rules consistent for backend selection and URL rewrites, fixes `PathPrefix` semantics, and respects Gateway listener `allowedRoutes`.
 - **CLI and OpenAI-compatible API improvements:** The CLI now exposes richer status output and supports `ModelRoute` and `ModelServer`, while the router adds an OpenAI-compatible `GET /v1/models` endpoint.
 
@@ -120,7 +120,7 @@ Related changes:
 - Proposal:
   - [Observability for prefix-cache and kvcache-aware Score Plugins](https://github.com/volcano-sh/kthena/blob/main/docs/proposal/cache-observability.md)
 - PRs:
-  - [feat(router): add per-pod on-flight request tracking with Redis sync #962](https://github.com/volcano-sh/kthena/pull/962)
+  - [feat(router): add per-pod in-flight request tracking with Redis sync #962](https://github.com/volcano-sh/kthena/pull/962)
   - [Add SGLang tokenizer support for KV-cache-aware scheduling #997](https://github.com/volcano-sh/kthena/pull/997)
   - [router: add observability metrics for prefix-cache and kvcache-aware score plugins #1194](https://github.com/volcano-sh/kthena/pull/1194)
   - [feat(router): make pod metrics update interval configurable #1151](https://github.com/volcano-sh/kthena/pull/1151)
@@ -400,6 +400,6 @@ kubectl get modelservers.networking.serving.volcano.sh --all-namespaces
 
 Thank you to everyone who contributed to Kthena v1.0.0 across controllers, router, autoscaler, CLI, Helm charts, examples, docs, CI, generated clients, and tests.
 
-Special thanks to contributors including [@Abirdcfly](https://github.com/Abirdcfly), [@Alivestars04](https://github.com/Alivestars04), [@anirudh240](https://github.com/anirudh240), [@avinxshKD](https://github.com/avinxshKD), [@blenbot](https://github.com/blenbot), [@FAUST-BENCHOU](https://github.com/FAUST-BENCHOU), [@hzxuzhonghu](https://github.com/hzxuzhonghu), [@JagjeevanAK](https://github.com/JagjeevanAK), [@katara-Jayprakash](https://github.com/katara-Jayprakash), [@kube-gopher](https://github.com/kube-gopher), [@LiZhenCheng9527](https://github.com/LiZhenCheng9527), [@madmecodes](https://github.com/madmecodes), [@nabrahma](https://github.com/nabrahma), [@nXtCyberNet](https://github.com/nXtCyberNet), [@rajnish-jais](https://github.com/rajnish-jais), [@Sanchit2662](https://github.com/Sanchit2662), [@verma-garv](https://github.com/verma-garv), [@WHOIM1205](https://github.com/WHOIM1205), [@xrwang8](https://github.com/xrwang8), and [@zhy76](https://github.com/zhy76),[@YaoZengzeng](https://github.com/YaoZengzeng).
+Special thanks to contributors including [@Abirdcfly](https://github.com/Abirdcfly), [@Alivestars04](https://github.com/Alivestars04), [@anirudh240](https://github.com/anirudh240), [@avinxshKD](https://github.com/avinxshKD), [@blenbot](https://github.com/blenbot), [@FAUST-BENCHOU](https://github.com/FAUST-BENCHOU), [@hzxuzhonghu](https://github.com/hzxuzhonghu), [@JagjeevanAK](https://github.com/JagjeevanAK), [@katara-Jayprakash](https://github.com/katara-Jayprakash), [@kube-gopher](https://github.com/kube-gopher), [@LiZhenCheng9527](https://github.com/LiZhenCheng9527), [@madmecodes](https://github.com/madmecodes), [@nabrahma](https://github.com/nabrahma), [@nXtCyberNet](https://github.com/nXtCyberNet), [@rajnish-jais](https://github.com/rajnish-jais), [@Sanchit2662](https://github.com/Sanchit2662), [@verma-garv](https://github.com/verma-garv), [@WHOIM1205](https://github.com/WHOIM1205), [@xrwang8](https://github.com/xrwang8), and [@zhy76](https://github.com/zhy76), [@YaoZengzeng](https://github.com/YaoZengzeng).
 
 We warmly invite developers, operators, and AI infrastructure teams to try Kthena v1.0.0 and help shape the next generation of cloud native LLM serving.
