@@ -1357,6 +1357,10 @@ func (s *store) matchesSpecificGateway(mr *aiv1alpha1.ModelRoute, gatewayKey str
 	}
 
 	for _, parentRef := range mr.Spec.ParentRefs {
+		if !isGatewayParentRef(parentRef) {
+			continue
+		}
+
 		// Get namespace from parentRef, default to ModelRoute's namespace
 		namespace := mr.Namespace
 		if parentRef.Namespace != nil {
